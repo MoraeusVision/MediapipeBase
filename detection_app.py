@@ -21,7 +21,7 @@ from utils import parse_video_source
 logging.basicConfig(level=logging.INFO, format='[%(asctime)s] [%(levelname)s] %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
 
 MODEL_PATH = "models/pose_landmarker_heavy.task"
-VIDEO_PATH = "example_media/pullup_1.mp4"
+VIDEO_PATH = "example_media/pullup_2.mp4"
 OUTPUT_VIDEO_PATH = "output/saved_video.mp4"
 MIN_VISIBILITY = 0.5
 
@@ -234,12 +234,16 @@ class BaseKeypointsApp(ABC):
         min_pose_presence_confidence: float,
         min_tracking_confidence: float,
         draw_keypoint_names: bool,
+        smoothing_alpha: float = 0.75,
     ):
         self.show = show
         self.save = save
         self.output_path = output_path
         self.last_frame = None
         self.video_source = parse_video_source(video_source)
+
+        self.alpha = smoothing_alpha
+        self.prev_keypoints: Optional[dict[str, Keypoint2D]] = None
 
         # Initialize estimator (MediaPipe Tasks)
         self.estimator = MediaPipePoseEstimator(
@@ -284,7 +288,10 @@ class BaseKeypointsApp(ABC):
         """
         Runs for each frame after inference. Renders and handles output.
         """
-        processed_prediction = self.process_predicted_frame(prediction=prediction, video_frame=video_frame)
+
+        smoothed_prediction = self._apply_smoothing(prediction)
+
+        processed_prediction = self.process_predicted_frame(prediction=smoothed_prediction, video_frame=video_frame)
 
         if self.show or self.save:
             rendered_frame = self.renderer.render(processed_prediction, video_frame)
@@ -302,6 +309,39 @@ class BaseKeypointsApp(ABC):
         """
         self.last_frame = frame
         self.output_manager.emit(frame, self.pipeline)
+
+    def _apply_smoothing(
+        self, prediction: Optional[KeypointsPrediction]
+    ) -> Optional[KeypointsPrediction]:
+        """Apply Exponential Moving Average (EMA) smoothing to reduce keypoint jitter."""
+        if prediction is None:
+            self.prev_keypoints = None
+            return None
+
+        if self.alpha >= 1.0:  # No smoothing
+            return prediction
+
+        if self.prev_keypoints is None:
+            self.prev_keypoints = prediction.keypoints.copy()
+            return prediction
+
+        # Apply EMA smoothing
+        smoothed: dict[str, Keypoint2D] = {}
+        for name, kp in prediction.keypoints.items():
+            prev = self.prev_keypoints.get(name)
+            if prev is None:
+                smoothed[name] = kp
+                continue
+
+            # Smooth x, y and visibility
+            x = int(self.alpha * prev.x + (1 - self.alpha) * kp.x)
+            y = int(self.alpha * prev.y + (1 - self.alpha) * kp.y)
+            vis = self.alpha * prev.visibility + (1 - self.alpha) * kp.visibility
+
+            smoothed[name] = Keypoint2D(x=x, y=y, visibility=vis)
+
+        self.prev_keypoints = smoothed
+        return KeypointsPrediction(keypoints=smoothed)
 
     def run(self) -> None:
         """
@@ -354,6 +394,13 @@ def parse_args():
     parser.add_argument("--show", action="store_true", default=False)
     parser.add_argument("--save", action="store_true", default=False)
 
+    parser.add_argument(
+        "--smoothing-alpha",
+        type=float,
+        default=0.1,
+        help="Smoothing alpha (0-1) - lower number gives more smoothing",
+    )
+
     return parser.parse_args()
 
 
@@ -370,5 +417,6 @@ if __name__ == "__main__":
         min_pose_presence_confidence=args.min_pose_presence_confidence,
         min_tracking_confidence=args.min_tracking_confidence,
         draw_keypoint_names=args.draw_keypoint_names,
+        smoothing_alpha=args.smoothing_alpha,
     )
     app.run()
